@@ -33,35 +33,39 @@ usage() {
 # 1. 卸载（干净恢复）
 #############################################
 uninstall_all() {
-    YELLOW "[1/5] 清理 swap..."
+    YELLOW "[1/4] 清理 swap..."
     swapoff -a || true
-    rm -f "$SWAPFILE"
+    [ -f "$SWAPFILE" ] && rm -f "$SWAPFILE"
     sed -i '/\/swapfile/d' /etc/fstab
 
-    YELLOW "[2/5] 清理 ZRAM..."
+    YELLOW "[2/4] 清理 ZRAM..."
     systemctl stop systemd-zram-setup@zram0.service 2>/dev/null || true
     systemctl disable systemd-zram-setup@zram0.service 2>/dev/null || true
-    rm -f "$ZRAM_CONF"
 
-    for i in /sys/class/zram/zram*; do
-        echo 1 > "$i/reset" 2>/dev/null || true
+    # 安全遍历并 reset（如果有 zram 设备）
+    for Z in /sys/class/zram/zram*; do
+        [ -e "$Z" ] || continue
+        echo 1 > "$Z/reset" 2>/dev/null || true
     done
 
-    YELLOW "[3/5] 清理 zramswap（兼容旧系统）..."
+    rm -f "$ZRAM_CONF"
+
+    YELLOW "[3/4] 清理 zramswap（兼容旧系统）..."
     systemctl stop zramswap 2>/dev/null || true
     systemctl disable zramswap 2>/dev/null || true
     rm -f /etc/default/zramswap
 
-    YELLOW "[4/5] 删除 sysctl 优化..."
-    rm -f "$SYSCTL_CONF"
-    sysctl --system >/dev/null
+    YELLOW "[4/4] 删除 sysctl 优化..."
+    rm -f /etc/sysctl.d/99-memctl.conf
 
-    YELLOW "[5/5] 删除自动检查服务..."
-    rm -f "$CHECK_SERVICE" "$CHECK_TIMER"
-    systemctl daemon-reload
+    # 强制移除所有非法 sysctl 参数（用户旧脚本残留）
+    sed -i '/tcp_adv_win_scale/d' /etc/sysctl* 2>/dev/null || true
 
-    GREEN "卸载完成（系统现为纯物理内存）。"
+    sysctl --system > /dev/null || true
+
+    GREEN "卸载完成（系统现在只使用物理内存）。"
 }
+
 
 
 #############################################
