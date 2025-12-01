@@ -59,7 +59,7 @@ uninstall_all() {
     rm -f /etc/sysctl.d/99-memctl.conf
 
     # 强制移除所有非法 sysctl 参数（用户旧脚本残留）
-    sed -i '/tcp_adv_win_scale/d' /etc/sysctl* 2>/dev/null || true
+    # sed -i '/tcp_adv_win_scale/d' /etc/sysctl* 2>/dev/null || true
 
     sysctl --system > /dev/null || true
 
