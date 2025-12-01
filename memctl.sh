@@ -1,175 +1,148 @@
 #!/bin/bash
 set -e
 
-ACTION="$1"
+ZRAM_CONF="/etc/systemd/zram-generator.conf"
+SYSCTL_CONF="/etc/sysctl.d/99-memctl.conf"
+SWAPFILE="/swapfile"
 
-log() { echo -e "\033[36m[MemCtl]\033[0m $1"; }
+###########################################################
+# 完整清理（install/uninstall 前必须调用）
+###########################################################
+cleanup_all() {
+    echo "[MemCtl] 清理旧 swap / zram / zramswap / 配置..."
 
-CPU_CORES=$(nproc)
-TOTAL_RAM_GB=$(awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo)
+    # 1. 停所有 zram swap
+    for dev in /dev/zram*; do
+        [ -e "$dev" ] || continue
+        echo "[MemCtl] swapoff $dev"
+        swapoff "$dev" 2>/dev/null || true
+    done
 
-###########################################
-# Install 内存优化
-###########################################
-install_mem() {
-    log "开始安装：ZRAM + 2GB swapfile + sysctl 优化"
+    # 2. 停 systemd zram 服务
+    for svc in $(systemctl list-units --all 'systemd-zram-setup@*' --no-legend | awk '{print $1}'); do
+        echo "[MemCtl] 停止并禁用 $svc"
+        systemctl stop "$svc" 2>/dev/null || true
+        systemctl disable "$svc" 2>/dev/null || true
+    done
 
-    # ---- 1. swapfile 2GB
-    SWAPFILE="/swapfile"
-
-    if [ ! -f $SWAPFILE ]; then
-        log "创建 2GB swapfile..."
-        dd if=/dev/zero of=$SWAPFILE bs=1G count=2 status=progress
-        chmod 600 $SWAPFILE
-        mkswap $SWAPFILE
-        echo "/swapfile none swap sw,pri=50 0 0" >> /etc/fstab
+    # 3. 删除 zramswap（旧系统组件）
+    if systemctl status zramswap.service >/dev/null 2>&1; then
+        echo "[MemCtl] 禁用 zramswap"
+        systemctl stop zramswap || true
+        systemctl disable zramswap || true
     fi
 
-    log "启用 swapfile pri=50"
-    swapon --priority 50 $SWAPFILE || true
+    # 4. 删除 zram-generator 配置
+    if [ -f "$ZRAM_CONF" ]; then
+        echo "[MemCtl] 删除 $ZRAM_CONF"
+        rm -f "$ZRAM_CONF"
+    fi
 
-    # ---- 2. ZRAM 多分片（总内存的 50%）
-    ZRAM_TOTAL=$(( TOTAL_RAM_GB / 2 ))
-    [ "$ZRAM_TOTAL" -lt 1 ] && ZRAM_TOTAL=1
+    # 5. 删除 memctl sysctl
+    if [ -f "$SYSCTL_CONF" ]; then
+        echo "[MemCtl] 删除 sysctl 配置"
+        rm -f "$SYSCTL_CONF"
+    fi
 
-    PER=$(( ZRAM_TOTAL / 4 ))
-    [ "$PER" -lt 1 ] && PER=1
+    # 6. 删除 swapfile
+    if [ -f "$SWAPFILE" ]; then
+        echo "[MemCtl] 删除 swapfile"
+        swapoff "$SWAPFILE" 2>/dev/null || true
+        rm -f "$SWAPFILE"
+    fi
 
-    log "配置 ZRAM：总 ${ZRAM_TOTAL}G，每片 ${PER}G"
+    # 7. fstab 清理 swapfile
+    sed -i '/\/swapfile/d' /etc/fstab
 
-    cat >/etc/systemd/zram-generator.conf <<EOF
+    echo "[MemCtl] systemd reload"
+    systemctl daemon-reload || true
+
+    echo "[MemCtl] sysctl reload"
+    sysctl --system >/dev/null 2>&1 || true
+
+    echo "[MemCtl] 清理完成"
+}
+
+###########################################################
+# 安装：8G ZRAM + 2G swapfile
+###########################################################
+do_install() {
+    echo "[MemCtl] 开始安装：ZRAM + 2GB swapfile + sysctl 优化"
+
+    cleanup_all
+
+    ###########################################################
+    # 1. 创建 2G swapfile
+    ###########################################################
+    echo "[MemCtl] 创建 2GB swapfile..."
+    dd if=/dev/zero of=$SWAPFILE bs=1G count=2 status=progress
+    chmod 600 $SWAPFILE
+    mkswap $SWAPFILE
+    swapon --priority 50 $SWAPFILE
+
+    ###########################################################
+    # 2. 配置 ZRAM（8GB）
+    ###########################################################
+    echo "[MemCtl] 配置 ZRAM（8G）"
+
+    cat >"$ZRAM_CONF" <<EOF
 [zram0]
-zram-size = ${PER}G
-compression-algorithm = zstd
-swap-priority = 100
-[zram1]
-zram-size = ${PER}G
-compression-algorithm = zstd
-swap-priority = 100
-[zram2]
-zram-size = ${PER}G
-compression-algorithm = zstd
-swap-priority = 100
-[zram3]
-zram-size = ${PER}G
+zram-size = 8G
 compression-algorithm = zstd
 swap-priority = 100
 EOF
 
     systemctl daemon-reload
-    for i in 0 1 2 3; do
-        systemctl restart systemd-zram-setup@zram$i.service || true
-    done
+    systemctl restart systemd-zram-setup@zram0.service
 
-    # ---- 3. sysctl
-    log "写入 sysctl 优化参数"
-    cat >/etc/sysctl.d/99-memctl.conf <<EOF
+    ###########################################################
+    # 3. sysctl 优化
+    ###########################################################
+    echo "[MemCtl] 写入 sysctl"
+
+    cat >"$SYSCTL_CONF" <<EOF
 vm.swappiness = 10
 vm.vfs_cache_pressure = 50
 vm.dirty_ratio = 10
 vm.dirty_background_ratio = 5
 EOF
+
     sysctl --system
 
-    # ---- 4. systemd 定时检查
-    log "创建定时检查任务"
-
-cat >/etc/systemd/system/memctl-check.service <<EOF
-[Unit]
-Description=MemCtl Memory Auto Check
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/bash /usr/local/bin/memctl.sh check
-EOF
-
-cat >/etc/systemd/system/memctl-check.timer <<EOF
-[Unit]
-Description=Run MemCtl Check Every 10 Minutes
-
-[Timer]
-OnBootSec=3min
-OnUnitActiveSec=10min
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now memctl-check.timer
-
-    # ---- 5. 主脚本自身复制到系统目录
-    cp -f "$0" /usr/local/bin/memctl.sh
-    chmod +x /usr/local/bin/memctl.sh
-
-    log "安装完成！"
+    echo ""
+    echo "[MemCtl] 安装完成"
     swapon --show
 }
 
-###########################################
-# Uninstall 卸载所有 ZRAM/SWAP
-###########################################
-uninstall_mem() {
-    log "卸载：恢复纯物理内存"
+###########################################################
+# 卸载：恢复只有物理内存
+###########################################################
+do_uninstall() {
+    echo "[MemCtl] 卸载：恢复到纯物理内存"
+    cleanup_all
 
-    # ---- 停止 timer
-    systemctl disable --now memctl-check.timer 2>/dev/null || true
-    rm -f /etc/systemd/system/memctl-check.service
-    rm -f /etc/systemd/system/memctl-check.timer
-
-    # ---- swapfile
-    swapoff -a || true
-    sed -i '\|/swapfile|d' /etc/fstab
-    rm -f /swapfile || true
-
-    # ---- ZRAM
-    rm -f /etc/systemd/zram-generator.conf
-    for dev in /dev/zram*; do
-        swapoff $dev 2>/dev/null || true
-        echo 1 > /sys/block/$(basename $dev)/reset 2>/dev/null || true
-    done
-
-    # ---- sysctl
-    rm -f /etc/sysctl.d/99-memctl.conf
-    sysctl --system || true
-
-    log "卸载完成！"
+    echo "[MemCtl] 卸载完成，当前 swap 状态："
+    swapon --show || true
 }
 
-###########################################
-# Check 自动检查
-###########################################
-check_mem() {
-    log "执行内存系统检查..."
-
-    # ---- 禁止系统 swap 分区被意外开启
-    if swapon --show | grep -q "partition"; then
-        log "⚠ 检测到系统 swap 分区，已关闭"
-        swapoff -a || true
-    fi
-
-    # ---- ZRAM 状态检查
-    for i in 0 1 2 3; do
-        if ! swapon --show | grep -q "zram$i"; then
-            log "⚠ zram$i 未启用，自动重启"
-            systemctl restart systemd-zram-setup@zram$i.service || true
-        fi
-    done
-
-    log "检查完成"
-}
-
-###########################################
-# 主控制逻辑
-###########################################
-case "$ACTION" in
-    install|"")
-        install_mem ;;
+###########################################################
+# 主入口
+###########################################################
+case "$1" in
+    install)
+        do_install
+        ;;
     uninstall)
-        uninstall_mem ;;
-    check)
-        check_mem ;;
+        do_uninstall
+        ;;
+    cleanup)
+        cleanup_all
+        ;;
     *)
-        echo "用法：bash memctl.sh [install|uninstall|check]"
-        exit 1 ;;
+        echo "使用方法:"
+        echo "  bash memctl.sh install     # 安装"
+        echo "  bash memctl.sh uninstall   # 卸载"
+        echo "  bash memctl.sh cleanup     # 仅清理"
+        exit 1
+        ;;
 esac
