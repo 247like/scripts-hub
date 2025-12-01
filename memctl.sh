@@ -89,6 +89,7 @@ install_all() {
 zram-size = 8G
 compression-algorithm = zstd
 swap-priority = 100
+max-comp-streams = 0
 EOF
 
     systemctl daemon-reload
